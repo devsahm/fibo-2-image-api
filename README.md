@@ -43,7 +43,7 @@ modal run modal_app.py::download     # one-time: download the model (~30 GB, 10�
 modal serve modal_app.py             # start the API
 ```
 
-`modal serve` prints a URL like `https://your-name--fibo-api-web-dev.modal.run`. Keep the terminal open. Press **Ctrl-C** to stop.
+`modal serve` prints a URL like `https://your-name--fibo-api-web-dev.modal.run`. Keep the terminal open. Press **Ctrl-C** to stop. The URL is public, so don't share it.
 
 Open `<URL>/health` in your browser. The first time, it takes 1–3 minutes to load the model. Wait until you see `"loaded": true`.
 
@@ -67,10 +67,10 @@ curl -X POST "<URL>/v1/text-to-image?format=png" \
   -d '{"prompt": "An origami whale swimming through paper clouds", "seed": 7}' \
   -o whale.png
 
-# Image editing
+# Image editing (images can be public URLs or base64 strings)
 curl -X POST "<URL>/v1/image-editing?format=png" \
-  -F "images=@photo.jpg" \
-  -F "prompt=replace the jacket with a red leather one" \
+  -H "Content-Type: application/json" \
+  -d '{"images": ["https://example.com/photo.jpg"], "prompt": "replace the jacket with a red leather one"}' \
   -o edited.png
 ```
 
@@ -79,7 +79,7 @@ curl -X POST "<URL>/v1/image-editing?format=png" \
 | Endpoint | Send | Get back |
 | --- | --- | --- |
 | `POST /v1/text-to-image` | JSON: `prompt` | New image |
-| `POST /v1/image-editing` | Form: 1 image + `prompt` | Edited image |
+| `POST /v1/image-editing` | JSON: `images` (1 public URL or base64 string) + `prompt` | Edited image |
 | | 1 image + `mask` + `prompt` | Only the white area of the mask changes |
 | | 2–4 images + `prompt` (refer to them as `<image_1>`, `<image_2>`) | Combined image, e.g. virtual try-on |
 | `GET /health` | | Whether the model is loaded, GPU memory use |
@@ -107,12 +107,6 @@ docker run --gpus all -p 8000:8000 --env-file .env -v fibo-models:/models fibo-a
 ```
 
 The API is then at `http://SERVER_IP:8000`. On a 24 GB GPU, set `CPU_OFFLOAD=1` in `.env` (slower).
-
-## Costs
-
-- **Modal:** about $2/hour for the GPU, billed only while running. Each start costs 1–3 minutes of model loading, then 15–60 seconds per image. New accounts get free monthly credit.
-- **Gemini:** a small charge per plain-text prompt. Requests that send `structured_prompt` skip Gemini.
-- Your Modal URL is public, and anyone who has it can use your credit. Don't share it.
 
 ## Troubleshooting
 

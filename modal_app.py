@@ -44,7 +44,7 @@ image = (
 # A persistent disk. The model is downloaded into it once and reused by every container.
 models = modal.Volume.from_name("fibo-models", create_if_missing=True)
 
-# HF_TOKEN, GEMINI_API_KEY and the optional API_KEY are read from your local .env and passed in as env vars.
+# HF_TOKEN, GEMINI_API_KEY etc. are read from your local .env and passed in as env vars.
 secrets = [modal.Secret.from_dotenv(HERE)]
 
 app = modal.App("fibo-api", image=image)

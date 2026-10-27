@@ -6,7 +6,7 @@ A FastAPI server that loads briaai/Fibo-2.0-dev onto a GPU once at startup and
 exposes two endpoints:
 
   POST /v1/text-to-image   -> JSON body, returns a generated image
-  POST /v1/image-editing   -> multipart upload (1-4 images, optional mask), returns an edited image
+  POST /v1/image-editing   -> JSON body (1-4 images as base64 or public URLs, optional mask), returns an edited image
 
 How a request flows:
   1. Your plain-language prompt goes to bria-vgl, which (via Gemini) rewrites it
@@ -29,16 +29,15 @@ import logging
 import math
 import os
 import random
-import secrets
 import time
+import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any, List, Literal, Optional, Union
 
 import torch
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Security, UploadFile
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
-from fastapi.security import APIKeyHeader
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, model_validator
 
@@ -46,7 +45,6 @@ from pydantic import BaseModel, Field, model_validator
 # Configuration (all via environment variables — see .env.example)
 # --------------------------------------------------------------------------------------
 MODEL_ID = os.getenv("MODEL_ID", "briaai/Fibo-2.0-dev")
-API_KEY = os.getenv("API_KEY")  # if unset, the API is open (fine for local testing only)
 CPU_OFFLOAD = os.getenv("CPU_OFFLOAD", "0") == "1"  # set to 1 on 24 GB cards (slower)
 FLASH_ATTENTION_3 = os.getenv("FLASH_ATTENTION_3", "0") == "1"  # H100 only
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
@@ -132,17 +130,6 @@ app = FastAPI(
 
 
 # --------------------------------------------------------------------------------------
-# Auth
-# --------------------------------------------------------------------------------------
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-
-async def require_api_key(key: Optional[str] = Security(api_key_header)) -> None:
-    if API_KEY and not (key and secrets.compare_digest(key, API_KEY)):
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header.")
-
-
-# --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
 def snap16(x: int) -> int:
@@ -164,14 +151,31 @@ def image_to_png_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-async def read_upload(upload: UploadFile, mode: str) -> Image.Image:
-    data = await upload.read()
-    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, f"{upload.filename}: file larger than {MAX_UPLOAD_MB} MB.")
+def fetch_url(url: str, limit: int) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "fibo-api"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read(limit + 1)
+
+
+async def load_image(src: str, name: str, mode: str) -> Image.Image:
+    """Public http(s) URL or base64 string (a "data:image/...;base64," prefix is allowed) -> PIL image."""
+    limit = MAX_UPLOAD_MB * 1024 * 1024
+    if src.startswith(("http://", "https://")):
+        try:
+            data = await run_in_threadpool(fetch_url, src, limit)
+        except Exception as e:
+            raise HTTPException(400, f"{name}: could not download {src} ({e}).")
+    else:
+        try:
+            data = base64.b64decode(src.split(",", 1)[-1], validate=True)
+        except ValueError:
+            raise HTTPException(400, f"{name}: not a valid URL or base64 string.")
+    if len(data) > limit:
+        raise HTTPException(413, f"{name}: image larger than {MAX_UPLOAD_MB} MB.")
     try:
         return Image.open(io.BytesIO(data)).convert(mode)
     except UnidentifiedImageError:
-        raise HTTPException(400, f"{upload.filename}: not a readable image.")
+        raise HTTPException(400, f"{name}: not a readable image.")
 
 
 def scene_to_json(scene) -> str:
@@ -287,7 +291,7 @@ class TextToImageRequest(BaseModel):
         return self
 
 
-@app.post("/v1/text-to-image", response_model=ImageResult, dependencies=[Depends(require_api_key)])
+@app.post("/v1/text-to-image", response_model=ImageResult)
 async def text_to_image(
     req: TextToImageRequest,
     format: Literal["json", "png"] = Query("json", description="json = base64 + metadata, png = raw image"),
@@ -317,31 +321,41 @@ async def text_to_image(
     return build_response(image, caption, seed, req.steps, req.guidance_scale, seconds, format)
 
 
-@app.post("/v1/image-editing", response_model=ImageResult, dependencies=[Depends(require_api_key)])
+class ImageEditingRequest(BaseModel):
+    images: List[str] = Field(
+        ..., min_length=1, max_length=4,
+        description="1 source image, or up to 4 references (<image_1>, <image_2>...), as public URLs or base64 strings",
+    )
+    prompt: Optional[str] = Field(None, description="Edit instruction, e.g. 'replace the jacket with a red leather one'")
+    mask: Optional[str] = Field(None, description="Optional mask (URL or base64): white = area to change, black = keep. Single image only.")
+    structured_prompt: Optional[Union[dict, str]] = Field(None, description="Advanced: your own VGL JSON. Skips Gemini.")
+    steps: int = Field(DEFAULT_STEPS, ge=1, le=100)
+    guidance_scale: float = Field(DEFAULT_GUIDANCE, ge=0.0, le=20.0)
+    seed: Optional[int] = Field(None, ge=0)
+
+    @model_validator(mode="after")
+    def _check(self):
+        if not self.prompt and not self.structured_prompt:
+            raise ValueError("Provide either 'prompt' or 'structured_prompt'.")
+        if self.mask and len(self.images) != 1:
+            raise ValueError("A mask can only be used with exactly one source image.")
+        return self
+
+
+@app.post("/v1/image-editing", response_model=ImageResult)
 async def image_editing(
-    images: List[UploadFile] = File(..., description="1 source image, or up to 4 references (<image_1>, <image_2>...)"),
-    prompt: Optional[str] = Form(None, description="Edit instruction, e.g. 'replace the jacket with a red leather one'"),
-    mask: Optional[UploadFile] = File(None, description="Optional: white = area to change, black = keep. Single image only."),
-    structured_prompt: Optional[str] = Form(None, description="Advanced: your own VGL JSON. Skips Gemini."),
-    steps: int = Form(DEFAULT_STEPS, ge=1, le=100),
-    guidance_scale: float = Form(DEFAULT_GUIDANCE, ge=0.0, le=20.0),
-    seed: Optional[int] = Form(None, ge=0),
-    format: Literal["json", "png"] = Query("json"),
+    req: ImageEditingRequest,
+    format: Literal["json", "png"] = Query("json", description="json = base64 + metadata, png = raw image"),
 ):
-    if not prompt and not structured_prompt:
-        raise HTTPException(422, "Provide either 'prompt' or 'structured_prompt'.")
-    if not 1 <= len(images) <= 4:
-        raise HTTPException(422, "Send between 1 and 4 images.")
-    if mask is not None and len(images) != 1:
-        raise HTTPException(422, "A mask can only be used with exactly one source image.")
+    prompt, structured_prompt = req.prompt, req.structured_prompt
+    steps, guidance_scale = req.steps, req.guidance_scale
+    seed = req.seed if req.seed is not None else random.randint(0, 2**31 - 1)
 
-    seed = seed if seed is not None else random.randint(0, 2**31 - 1)
-
-    # Load and resize inputs to ~1 MP (the size the model was trained at)
-    sources = [fit_to_megapixel(await read_upload(f, "RGB")) for f in images]
+    # Decode and resize inputs to ~1 MP (the size the model was trained at)
+    sources = [fit_to_megapixel(await load_image(src, f"images[{i}]", "RGB")) for i, src in enumerate(req.images)]
     mask_img = None
-    if mask is not None:
-        mask_img = (await read_upload(mask, "L")).resize(sources[0].size, Image.NEAREST)
+    if req.mask:
+        mask_img = (await load_image(req.mask, "mask", "L")).resize(sources[0].size, Image.NEAREST)
 
     # Step 1 — write the edit blueprint
     edit_instruction = None
