@@ -1,0 +1,16 @@
+# PyTorch (with CUDA) comes from the Docker base image.
+# If installing by hand, install torch + torchvision for your CUDA version first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pillow>=10.0
+transformers
+accelerate
+huggingface_hub
+bria-vgl
+
+# BriaFibo2Pipeline is not in a diffusers release yet (PR #14991).
+# Once it's merged, replace this line with:  diffusers>=<the release that includes it>
+diffusers @ git+https://github.com/muhammadali-afridi/diffusers@ali/fibo2
